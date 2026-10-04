@@ -1,0 +1,8 @@
+.vs/
+.workbuddy/
+x64/
+dll-diff/
+*.user
+
+# agent-only MSBuild wrapper - humans build in VS, this stays untracked
+build.sh
