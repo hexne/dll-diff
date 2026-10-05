@@ -6,8 +6,11 @@ int main() {
 	constexpr std::string_view pdb_path = R"(C:\Users\hexne\Desktop\PocoJSONd.pdb)";
 
 	auto interfaces = dll_info::parse_interface(dll_path);
+	interfaces = dll_info::filter(interfaces, "Poco");
 	auto classes = dll_info::parse_class(pdb_path);
+	classes = dll_info::filter(classes, "Poco");
 	auto enums = dll_info::parse_enum(pdb_path);
+	enums = dll_info::filter(enums, "Poco");
 
 	std::println("\n=== interfaces ({}) ===", interfaces.size());
 	for (auto& info : interfaces) {

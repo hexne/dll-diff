@@ -1648,6 +1648,40 @@ export namespace dll_info {
 	return result;
 }
 
+	// 
+	std::vector<InterfaceInfo> filter(const std::vector<InterfaceInfo>& interfaces, std::string filter = "") {
+		std::vector<InterfaceInfo> ret{};
+		for (const auto& cur : interfaces) {
+			if (cur.string().find(filter) != std::string::npos) {
+				ret.push_back(cur);
+			}
+		}
+		return ret;
+	}
+	std::vector<TypeInfo> filter(const std::vector<TypeInfo>& types, std::string filter = "") {
+		std::vector<TypeInfo> ret{};
+		for (const auto& type : types) {
+			if (type.string().find(filter) != std::string::npos) {
+				ret.push_back(type);
+			}
+		}
+		return ret;
+	}
+	std::vector<EnumInfo> filter(const std::vector<EnumInfo>& enums, std::string filter = "") {
+		std::vector<EnumInfo> ret{};
+		for (const auto& enum_info : enums) {
+			// 与另外两个 filter 的语义对齐：对完整限定名做子串匹配，
+			// 否则 "Poco" 只会去裸类型名里找，namespace_name 全部漏掉
+			const std::string full = enum_info.namespace_name.empty()
+				? enum_info.name
+				: enum_info.namespace_name + "::" + enum_info.name;
+			if (full.find(filter) != std::string::npos) {
+				ret.push_back(enum_info);
+			}
+		}
+		return ret;
+	}
+
 } // namespace dll_info
 
 // ---- Internal helper definitions -------------------------------------------
