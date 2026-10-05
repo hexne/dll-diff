@@ -1038,7 +1038,7 @@ namespace dll_info {
 		bool is_left_ref{};
 		bool is_right_ref{};
 
-		TypeInfo(IDiaSymbol* hd) : handle(hd, release_symbol) {
+		explicit TypeInfo(IDiaSymbol* hd) : handle(hd, release_symbol) {
 			if (handle == nullptr) {
 				return;
 			}
@@ -1181,10 +1181,30 @@ namespace dll_info {
 			return result;
 		}
 
-		bool operator == (const TypeInfo& other) const {
-			// 如果类型替换后相同，则类型完全相同
-			if (utils::replace(remove_cv_string(), filter::filters) ==
-				utils::replace(other.remove_cv_string(), filter::filters)) {
+	// Same as `remove_cv_string()` but references go too (`&` / `&&`),
+	// mirroring `std::remove_cvref_t`: cv + reference stripped, pointers
+	// stay (a pointer is part of the type, not a qualifier). Renders the
+	// bare type identity, ignoring how it is passed around.
+	std::string remove_cvref_string() const {
+		std::string result;
+		if (!namespace_name.empty()) {
+			result += namespace_name + "::";
+		}
+		if (!name.empty()) {
+			result += name;
+		}
+		else {
+			result += "<unknown>";
+		}
+		if (is_pointer)
+			result += "*";
+		return result;
+	}
+
+	bool operator == (const TypeInfo& other) const {
+			// 如果类型替换后相同，则类型完全相同（cv 与引用都不参与比较）
+			if (utils::replace(remove_cvref_string(), filter::filters) ==
+				utils::replace(other.remove_cvref_string(), filter::filters)) {
 				return true;
 			}
 			// 否则需要比较基类是否相同（整条祖先链，不只是直接基类）
@@ -1193,12 +1213,12 @@ namespace dll_info {
 
 			// 一个类型是另一个类型的基类，则认为它们是相同的
 			bool this_is_base = std::ranges::any_of(other_bases, [this](const TypeInfo& cur) {
-				return utils::replace(remove_cv_string(), filter::filters) ==
-					utils::replace(cur.remove_cv_string(), filter::filters);
+				return utils::replace(remove_cvref_string(), filter::filters) ==
+					utils::replace(cur.remove_cvref_string(), filter::filters);
 			});
 			bool other_is_base = std::ranges::any_of(bases, [&other](const TypeInfo& cur) {
-				return utils::replace(other.remove_cv_string(), filter::filters) ==
-					utils::replace(cur.remove_cv_string(), filter::filters);
+				return utils::replace(other.remove_cvref_string(), filter::filters) ==
+					utils::replace(cur.remove_cvref_string(), filter::filters);
 			});
 
 			return this_is_base || other_is_base;
@@ -1222,7 +1242,7 @@ namespace dll_info {
 		std::shared_ptr<TypeInfo> return_info;
 		std::vector<std::shared_ptr<TypeInfo>> args_info;
 
-		InterfaceInfo(IDiaSymbol* hd) : handle(hd, release_symbol) {
+		explicit InterfaceInfo(IDiaSymbol* hd) : handle(hd, release_symbol) {
 			if (handle == nullptr) {
 				return;
 			}
@@ -1258,10 +1278,11 @@ namespace dll_info {
 					ULONG fetched = 0;
 					while (args->Next(1, &arg, &fetched) == S_OK && fetched == 1) {
 						IDiaSymbol* arg_type = nullptr;
-					if (arg->get_type(&arg_type) == S_OK && arg_type != nullptr) {
-						args_info.push_back(std::make_shared<TypeInfo>(arg_type));
-					}
-						arg->Release();						arg = nullptr;
+						if (arg->get_type(&arg_type) == S_OK && arg_type != nullptr) {
+							args_info.push_back(std::make_shared<TypeInfo>(arg_type));
+						}
+						arg->Release();						
+						arg = nullptr;
 					}
 					args->Release();
 				}
@@ -1269,6 +1290,100 @@ namespace dll_info {
 			function_type->Release();
 		}
 	}
+
+		std::string string() const {
+			std::string result;
+			if (!namespace_name.empty()) {
+				result += namespace_name + "::";
+			}
+			if (!class_name.empty()) {
+				result += class_name + "::";
+			}
+			result += name.empty() ? "<unknown>" : name;
+
+			result += "(";
+			for (std::size_t i = 0; i < args_info.size(); ++i) {
+				if (i != 0) {
+					result += ", ";
+				}
+				result += args_info[i]->string();
+			}
+			result += ")";
+
+			if (is_const) {
+				result += " const";
+			}
+			return result;
+		}
+
+		std::string remove_cv_string() const {
+			std::string result;
+			if (!namespace_name.empty()) {
+				result += namespace_name + "::";
+			}
+			if (!class_name.empty()) {
+				result += class_name + "::";
+			}
+			result += name.empty() ? "<unknown>" : name;
+
+			result += "(";
+			for (std::size_t i = 0; i < args_info.size(); ++i) {
+				if (i != 0) {
+					result += ", ";
+				}
+			result += args_info[i]->remove_cv_string();
+		}
+		result += ")";
+		return result;
+	}
+
+	// Same as `remove_cv_string()` but the arguments render through
+	// `TypeInfo::remove_cvref_string()`: cv + references stripped from
+	// every parameter, pointers stay. The function name part never had
+	// qualifiers, so only the argument list changes.
+	std::string remove_cvref_string() const {
+		std::string result;
+		if (!namespace_name.empty()) {
+			result += namespace_name + "::";
+		}
+		if (!class_name.empty()) {
+			result += class_name + "::";
+		}
+		result += name.empty() ? "<unknown>" : name;
+
+		result += "(";
+		for (std::size_t i = 0; i < args_info.size(); ++i) {
+			if (i != 0) {
+				result += ", ";
+			}
+			result += args_info[i]->remove_cvref_string();
+		}
+		result += ")";
+		return result;
+	}
+
+		bool operator == (const InterfaceInfo& other) const {
+			// 先比较接口名称，如果不同则不进行后续比较
+			if (name != other.name)
+				return false;
+
+			// 类：一边有类一边没有 → 不同；都有 → filter 相同或互为基类才继续
+			//（TypeInfo::operator== 已包含 filter 归一化 + 基类链两层语义）
+			if (!class_info || !other.class_info)
+				return class_info == other.class_info;
+			if (!(*class_info == *other.class_info))
+				return false;
+
+			// 参数：ranges::equal 自带长度检查与短路，解引用走深比较
+			if (!std::ranges::equal(args_info, other.args_info,
+				[](const auto& a, const auto& b) { return *a == *b; }))
+				return false;
+
+			// 返回值：深比较
+			if (!return_info || !other.return_info)
+				return return_info == other.return_info;
+			return *return_info == *other.return_info;
+		}
 };
 
 
@@ -1627,8 +1742,7 @@ export std::vector<TypeInfo> get_base_type(const TypeInfo& type) {
 // diamonds (the same base reached through several paths) and guards against
 // malformed cycles in the type graph. Keys are cv-stripped names so that
 // cv-variants of one base do not slip in twice.
-void collect_base_types(const TypeInfo& type, std::vector<TypeInfo>& chain,
-	std::set<std::string>& seen) {
+void collect_base_types(const TypeInfo& type, std::vector<TypeInfo>& chain, std::set<std::string>& seen) {
 	for (const TypeInfo& base : get_base_type(type)) {
 		if (seen.insert(base.remove_cv_string()).second) {
 			chain.push_back(base);
