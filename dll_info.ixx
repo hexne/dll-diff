@@ -6,6 +6,11 @@ import std;
 import utils;
 import filter;
 
+namespace dll_info { 
+	export struct TypeInfo;
+	export struct InterfaceInfo;
+	export struct EnumInfo;
+}
 
 std::string bstr_to_utf8(BSTR value) {
 	if (value == nullptr) {
@@ -37,7 +42,6 @@ std::string bstr_to_utf8(BSTR value) {
 		nullptr);
 	return result;
 }
-
 
 std::uint64_t array_element_count(IDiaSymbol* array, IDiaSymbol* element) {
 	DWORD count{};
@@ -183,12 +187,6 @@ std::string base_type_name(IDiaSymbol* symbol) {
 	}
 }
 
-// Builds a full type name.
-//
-// `declarator` carries the pointer / reference / array part that still has
-// to be attached to the base name. Keeping it as a separate string (instead
-// of naively appending `*`) is what makes C++ grouping possible, e.g.
-// `unsigned char (&)[65]` instead of `unsigned char[65]*`.
 std::string build_type_name(IDiaSymbol* symbol, const std::string& declarator, int depth) {
 	if (symbol == nullptr || depth > 24) {
 		return {};
@@ -344,7 +342,6 @@ std::string build_type_name(IDiaSymbol* symbol, const std::string& declarator, i
 	return own_name + declarator;
 }
 
-
 std::string symbol_name(IDiaSymbol* symbol) {
 	if (symbol == nullptr)
 		return {};
@@ -383,10 +380,6 @@ std::string class_parent_name(IDiaSymbol* symbol) {
 	return result;
 }
 
-// Position of the last `::` that is not inside a template argument list
-// (or any other bracket). A plain `rfind("::")` cuts
-// `std::basic_string<char,std::char_traits<char>,std::allocator<char> >`
-// into `std::basic_string<char,std::char_traits<char>,std` + `allocator<char> >`.
 std::size_t rfind_scope_operator(const std::string& text) {
 	int angle_depth = 0;
 	int paren_depth = 0;
@@ -482,8 +475,6 @@ std::pair<std::string, std::string> split_symbol_name(IDiaSymbol* symbol) {
 	};
 }
 
-
-
 bool is_const_member_function(IDiaSymbol* symbol) {
 	if (symbol == nullptr) {
 		return false;
@@ -526,7 +517,6 @@ bool is_const_member_function(IDiaSymbol* symbol) {
 	return result;
 }
 
-
 enum class ThisParameter {
 	// The symbol carries no parameter data at all - "unknown" must never be
 	// treated as "static".
@@ -535,7 +525,6 @@ enum class ThisParameter {
 	Missing
 };
 
-// A member function without a `this` parameter is a static one.
 ThisParameter probe_this_parameter(IDiaSymbol* symbol) {
 	if (symbol == nullptr) {
 		return ThisParameter::Unknown;
@@ -572,7 +561,6 @@ ThisParameter probe_this_parameter(IDiaSymbol* symbol) {
 	}
 	return any ? ThisParameter::Missing : ThisParameter::Unknown;
 }
-
 
 std::wstring utf8_to_wide(std::string_view text) {
 	if (text.empty()) {
@@ -632,7 +620,6 @@ HRESULT create_dia_source(IDiaDataSource** source) {
 		__uuidof(IDiaDataSource),
 		reinterpret_cast<void**>(source));
 }
-
 
 bool resolve_dll_export_function(IDiaSession* session, DWORD export_rva, DWORD& function_rva, IDiaSymbol** function) {
 	if (session == nullptr || function == nullptr) {
@@ -984,38 +971,141 @@ std::vector<DllExportInfo> read_dll_exports(const std::wstring& path) {
 	return result;
 }
 
-namespace dll_info {
+void release_symbol(IDiaSymbol* symbol) {
+	if (symbol != nullptr) {
+		symbol->Release();
+	}
+}
 
-	export struct EnumMemberInfo {
+std::int64_t variant_to_int64(const VARIANT& value) {
+	switch (value.vt) {
+	case VT_I1:
+		return value.cVal;
+
+	case VT_UI1:
+		return value.bVal;
+
+	case VT_I2:
+		return value.iVal;
+
+	case VT_UI2:
+		return value.uiVal;
+
+	case VT_I4:
+		return value.lVal;
+
+	case VT_UI4:
+		return value.ulVal;
+
+	case VT_I8:
+		return value.llVal;
+
+	case VT_UI8:
+		return static_cast<std::int64_t>(value.ullVal);
+
+	case VT_INT:
+		return value.intVal;
+
+	case VT_UINT:
+		return static_cast<std::int64_t>(value.uintVal);
+
+	case VT_BOOL:
+		return value.boolVal == VARIANT_TRUE ? 1 : 0;
+
+	case VT_R4:
+		return static_cast<std::int64_t>(value.fltVal);
+
+	case VT_R8:
+		return static_cast<std::int64_t>(value.dblVal);
+
+	default:
+		return 0;
+	}
+}
+
+void ensure_com_initialized() {
+	CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+}
+
+std::vector<dll_info::TypeInfo> get_base_types(const dll_info::TypeInfo& type);
+dll_info::EnumInfo build_enum_info(IDiaSymbol* symbol);
+
+export namespace dll_info {
+
+	// 枚举成员的两种拼写都封装成 EnumValue：
+	//   完整拼写 Poco::Message::Priority::PRIO_FATAL
+	//       -> namespace_name = "Poco::Message", class_name = "Priority"
+	//   裸拼写   Poco::Message::PRIO_FATAL（unscoped 枚举成员泄漏到外层作用域）
+	//       -> namespace_name = "Poco",        class_name = "Message"
+	// class_name 是成员的直接限定段：完整拼写下就是枚举名，裸拼写下是枚举所在的类。
+	struct EnumValue {
 		std::string name;
+		std::string namespace_name;
+		std::string class_name;
 		std::int64_t value{};
+
+		// 由拼写字符串构造：最后一次 :: 切出成员名，作用域末段是 class_name，其余是 namespace_name
+		explicit EnumValue(std::string spelling, std::int64_t member_value = 0) : value(member_value) {
+			const std::size_t member_separator = rfind_scope_operator(spelling);
+			if (member_separator == std::string::npos) {
+				name = std::move(spelling);
+				return;
+			}
+
+			name = spelling.substr(member_separator + 2);
+			std::string scope = spelling.substr(0, member_separator);
+			const std::size_t scope_separator = rfind_scope_operator(scope);
+			if (scope_separator == std::string::npos) {
+				class_name = std::move(scope);
+			}
+			else {
+				class_name = scope.substr(scope_separator + 2);
+				namespace_name = scope.substr(0, scope_separator);
+			}
+		}
+
+		std::string string() const {
+			std::string ret{};
+			if (!namespace_name.empty())
+				ret += namespace_name + "::";
+
+			if (!class_name.empty())
+				ret += class_name + "::";
+			ret += name.empty() ? "<unknown>" : name;
+			return ret;
+		}
+
+		bool operator == (const EnumValue& other) const {
+			if (name != other.name) {
+				return false;
+			}
+
+			const std::string scope = namespace_name.empty()
+				? class_name
+				: namespace_name + "::" + class_name;
+			const std::string other_scope = other.namespace_name.empty()
+				? other.class_name
+				: other.namespace_name + "::" + other.class_name;
+
+			// 作用域完全一致：同一枚举的同名成员
+			if (scope == other_scope) {
+				return true;
+			}
+
+			// unscoped 泄漏：完整拼写比裸拼写恰好多一层枚举名段，
+			// 即一边的完整作用域等于另一边的外层作用域
+			return scope == other.namespace_name || other_scope == namespace_name;
+		}
 	};
 
-	export struct EnumInfo {
+	struct EnumInfo {
 		std::string name;
 		std::string namespace_name;
 		std::size_t size{};  // size in bytes of the underlying type
-		std::vector<EnumMemberInfo> members;
+		std::vector<EnumValue> values;
 	};
 
-	// Deleter for `TypeInfo::handle`: adopts the reference the caller already
-	// holds (no AddRef on construction) and releases it when the last copy of
-	// the TypeInfo dies. Null-safe because the deleter also runs for null.
-	void release_symbol(IDiaSymbol* symbol) {
-		if (symbol != nullptr) {
-			symbol->Release();
-		}
-	}
-
-	// Defined after the parse functions; TypeInfo::operator== walks base
-	// chains, so the name has to be visible before the struct.
-	export struct TypeInfo;
-	export std::vector<TypeInfo> get_base_type(const TypeInfo& type);
-
-	// Whole ancestor chain (direct bases, their bases, ...), diamond-folded.
-	export std::vector<TypeInfo> get_base_types(const TypeInfo& type);
-
-	export struct TypeInfo {
+	struct TypeInfo {
 		// Owning: valid for as long as the TypeInfo (or any of its copies)
 		// lives, so interfaces returning TypeInfos keep usable handles.
 		std::shared_ptr<IDiaSymbol> handle;
@@ -1181,27 +1271,27 @@ namespace dll_info {
 			return result;
 		}
 
-	// Same as `remove_cv_string()` but references go too (`&` / `&&`),
-	// mirroring `std::remove_cvref_t`: cv + reference stripped, pointers
-	// stay (a pointer is part of the type, not a qualifier). Renders the
-	// bare type identity, ignoring how it is passed around.
-	std::string remove_cvref_string() const {
-		std::string result;
-		if (!namespace_name.empty()) {
-			result += namespace_name + "::";
+		// Same as `remove_cv_string()` but references go too (`&` / `&&`),
+		// mirroring `std::remove_cvref_t`: cv + reference stripped, pointers
+		// stay (a pointer is part of the type, not a qualifier). Renders the
+		// bare type identity, ignoring how it is passed around.
+		std::string remove_cvref_string() const {
+			std::string result;
+			if (!namespace_name.empty()) {
+				result += namespace_name + "::";
+			}
+			if (!name.empty()) {
+				result += name;
+			}
+			else {
+				result += "<unknown>";
+			}
+			if (is_pointer)
+				result += "*";
+			return result;
 		}
-		if (!name.empty()) {
-			result += name;
-		}
-		else {
-			result += "<unknown>";
-		}
-		if (is_pointer)
-			result += "*";
-		return result;
-	}
 
-	bool operator == (const TypeInfo& other) const {
+		bool operator == (const TypeInfo& other) const {
 			// 如果类型替换后相同，则类型完全相同（cv 与引用都不参与比较）
 			if (utils::replace(remove_cvref_string(), filter::filters) ==
 				utils::replace(other.remove_cvref_string(), filter::filters)) {
@@ -1225,8 +1315,7 @@ namespace dll_info {
 		}
 	};
 
-
-	export struct InterfaceInfo {
+	struct InterfaceInfo {
 		// Owning, same semantics as TypeInfo::handle: adopted from the caller,
 		// released when the last copy dies. Valid for the InterfaceInfo's
 		// lifetime, not just its constructor.
@@ -1386,140 +1475,42 @@ namespace dll_info {
 		}
 };
 
+	std::vector<InterfaceInfo> parse_interface(std::string_view path) {
 
-	std::int64_t variant_to_int64(const VARIANT& value) {
-		switch (value.vt) {
-		case VT_I1:
-			return value.cVal;
+	if (!std::filesystem::exists(path))
+		throw utils::format_runtime_error("File not found: {}", path);
 
-		case VT_UI1:
-			return value.bVal;
+	std::vector<dll_info::InterfaceInfo> result;
 
-		case VT_I2:
-			return value.iVal;
-
-		case VT_UI2:
-			return value.uiVal;
-
-		case VT_I4:
-			return value.lVal;
-
-		case VT_UI4:
-			return value.ulVal;
-
-		case VT_I8:
-			return value.llVal;
-
-		case VT_UI8:
-			return static_cast<std::int64_t>(value.ullVal);
-
-		case VT_INT:
-			return value.intVal;
-
-		case VT_UINT:
-			return static_cast<std::int64_t>(value.uintVal);
-
-		case VT_BOOL:
-			return value.boolVal == VARIANT_TRUE ? 1 : 0;
-
-		case VT_R4:
-			return static_cast<std::int64_t>(value.fltVal);
-
-		case VT_R8:
-			return static_cast<std::int64_t>(value.dblVal);
-
-		default:
-			return 0;
-		}
+	const std::wstring wide_path = utf8_to_wide(path);
+	if (wide_path.empty()) {
+		return result;
 	}
 
-	EnumInfo build_enum_info(IDiaSymbol* symbol) {
-		EnumInfo info;
-
-		auto [resolved_name, resolved_namespace] = split_symbol_name(symbol);
-		info.name = std::move(resolved_name);
-		info.namespace_name = std::move(resolved_namespace);
-
-		ULONGLONG length{};
-		if (symbol->get_length(&length) == S_OK) {
-			info.size = length;
-		}
-
-		IDiaEnumSymbols* members = nullptr;
-		if (SUCCEEDED(symbol->findChildren(SymTagData, nullptr, nsNone, &members)) &&
-			members != nullptr) {
-			IDiaSymbol* member = nullptr;
-			ULONG fetched = 0;
-			while (SUCCEEDED(members->Next(1, &member, &fetched)) && fetched == 1) {
-				EnumMemberInfo member_info;
-
-				BSTR bstr = nullptr;
-				if (member->get_name(&bstr) == S_OK && bstr != nullptr) {
-					member_info.name = bstr_to_utf8(bstr);
-					SysFreeString(bstr);
-				}
-
-				VARIANT value{};
-				if (member->get_value(&value) == S_OK) {
-					member_info.value = variant_to_int64(value);
-				}
-
-				info.members.push_back(std::move(member_info));
-
-				member->Release();
-				member = nullptr;
-			}
-			if (member != nullptr) {
-				member->Release();
-			}
-			members->Release();
-		}
-
-		return info;
+	const std::vector<DllExportInfo> exports = read_dll_exports(wide_path);
+	if (exports.empty()) {
+		return result;
 	}
 
+	ensure_com_initialized();
+	IDiaDataSource* source = nullptr;
+	if (SUCCEEDED(create_dia_source(&source)) && source != nullptr) {
+		if (SUCCEEDED(source->loadDataForExe(wide_path.c_str(), nullptr, nullptr))) {
+			IDiaSession* session = nullptr;
+			if (SUCCEEDED(source->openSession(&session)) && session != nullptr) {
+				std::vector<std::uint32_t> loaded_rvas;
+				loaded_rvas.reserve(exports.size());
 
-	export std::vector<InterfaceInfo> parse_dll(std::string_view path) {
-
-		if (!std::filesystem::exists(path))
-			throw utils::format_runtime_error("File not found: {}", path);
-
-		std::vector<InterfaceInfo> result;
-
-		const std::wstring wide_path = utf8_to_wide(path);
-		if (wide_path.empty()) {
-			return result;
-		}
-
-		const std::vector<DllExportInfo> exports = read_dll_exports(wide_path);
-		if (exports.empty()) {
-			return result;
-		}
-
-		const HRESULT init_result = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-		const bool uninitialize_com = SUCCEEDED(init_result);
-		if (FAILED(init_result) && init_result != RPC_E_CHANGED_MODE) {
-			return result;
-		}
-
-		IDiaDataSource* source = nullptr;
-		if (SUCCEEDED(create_dia_source(&source)) && source != nullptr) {
-			if (SUCCEEDED(source->loadDataForExe(wide_path.c_str(), nullptr, nullptr))) {
-				IDiaSession* session = nullptr;
-				if (SUCCEEDED(source->openSession(&session)) && session != nullptr) {
-					std::vector<std::uint32_t> loaded_rvas;
-					loaded_rvas.reserve(exports.size());
-
-					for (const DllExportInfo& exported : exports) {
-						DWORD function_rva = 0;
-						IDiaSymbol* function = nullptr;
-						if (!resolve_dll_export_function(
-							session,
-							exported.rva,
-							function_rva,
-							&function)) {
-							continue;
-						}
+				for (const DllExportInfo& exported : exports) {
+					DWORD function_rva = 0;
+					IDiaSymbol* function = nullptr;
+					if (!resolve_dll_export_function(
+						session,
+						exported.rva,
+						function_rva,
+						&function)) {
+						continue;
+					}
 
 					if (std::find(loaded_rvas.begin(), loaded_rvas.end(), function_rva) ==
 						loaded_rvas.end()) {
@@ -1530,179 +1521,142 @@ namespace dll_info {
 						// Not handed to an InterfaceInfo - still ours to release.
 						function->Release();
 					}
-					}
-
-					session->Release();
 				}
-			}
-			source->Release();
-		}
 
-		if (uninitialize_com) {
-			CoUninitialize();
-		}
-
-		return result;
-	}
-	// COM has to stay initialized for as long as any IDiaSymbol is alive. The
-	// parse functions hand out symbols wrapped in TypeInfos whose shared_ptr
-	// deleters release them long after the parse call has returned and called
-	// CoUninitialize - so the lifetime anchor has to live in the caller.
-	// Declare this BEFORE anything that holds TypeInfos: declared first means
-	// destroyed last, after every symbol is gone.
-	export struct com_guard {
-		bool owns_reference{ false };
-
-		com_guard() {
-			const HRESULT init_result = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-			owns_reference = SUCCEEDED(init_result);
-			// RPC_E_CHANGED_MODE: COM is already up on a different model - it
-			// stays usable, but it is not ours to shut down.
-		}
-
-		~com_guard() {
-			if (owns_reference) {
-				CoUninitialize();
-			}
-		}
-
-		com_guard(const com_guard&) = delete;
-		com_guard& operator=(const com_guard&) = delete;
-	};
-
-	export std::vector<InterfaceInfo> parse_pdb(std::string_view path) {
-		if (!std::filesystem::exists(path))
-			throw utils::format_runtime_error("File not found: {}", path);
-
-		std::vector<InterfaceInfo> result;
-		const std::wstring wide_path = utf8_to_wide(path);
-		if (wide_path.empty()) {
-			return result;
-		}
-
-		const HRESULT init_result = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-		const bool uninitialize_com = SUCCEEDED(init_result);
-		if (FAILED(init_result) && init_result != RPC_E_CHANGED_MODE) {
-			return result;
-		}
-
-		IDiaDataSource* source = nullptr;
-		if (SUCCEEDED(create_dia_source(&source)) && source != nullptr &&
-			SUCCEEDED(source->loadDataFromPdb(wide_path.c_str()))) {
-			IDiaSession* session = nullptr;
-			if (SUCCEEDED(source->openSession(&session)) && session != nullptr) {
-				IDiaSymbol* global_scope = nullptr;
-				if (SUCCEEDED(session->get_globalScope(&global_scope)) && global_scope != nullptr) {
-					IDiaEnumSymbols* functions = nullptr;
-					if (SUCCEEDED(global_scope->findChildren(
-						SymTagFunction,
-						nullptr,
-						nsNone,
-						&functions)) &&
-						functions != nullptr) {
-						IDiaSymbol* function = nullptr;
-						ULONG fetched = 0;
-						while (SUCCEEDED(functions->Next(1, &function, &fetched)) && fetched == 1) {
-							result.emplace_back(function);
-							function = nullptr;
-						}
-						if (function != nullptr) {
-							function->Release();
-						}
-						functions->Release();
-					}
-					global_scope->Release();
-				}
 				session->Release();
 			}
-			source->Release();
 		}
-
-		if (uninitialize_com) {
-			CoUninitialize();
-		}
-		return result;
+		source->Release();
 	}
 
-	// Enumerations are only reported by the global scope enumeration: their
-	// names are already fully qualified, so nested enums (`Poco::DateTime::Months`)
-	// come back in a single query. Walking the UDT hierarchy instead would
-	// produce the same template instantiation over and over again.
-	export std::vector<EnumInfo> parse_enums(std::string_view path) {
-		if (!std::filesystem::exists(path))
-			throw utils::format_runtime_error("File not found: {}", path);
-
-		std::vector<EnumInfo> result;
-		const std::wstring wide_path = utf8_to_wide(path);
-		if (wide_path.empty()) {
-			return result;
-		}
-
-		const HRESULT init_result = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-		const bool uninitialize_com = SUCCEEDED(init_result);
-		if (FAILED(init_result) && init_result != RPC_E_CHANGED_MODE) {
-			return result;
-		}
-
-		IDiaDataSource* source = nullptr;
-		if (SUCCEEDED(create_dia_source(&source)) && source != nullptr &&
-			SUCCEEDED(source->loadDataFromPdb(wide_path.c_str()))) {
-			IDiaSession* session = nullptr;
-			if (SUCCEEDED(source->openSession(&session)) && session != nullptr) {
-				IDiaSymbol* global_scope = nullptr;
-				if (SUCCEEDED(session->get_globalScope(&global_scope)) && global_scope != nullptr) {
-					IDiaEnumSymbols* enums = nullptr;
-					if (SUCCEEDED(global_scope->findChildren(
-						SymTagEnum,
-						nullptr,
-						nsNone,
-						&enums)) &&
-						enums != nullptr) {
-						// The same enumeration is reported once per compiland
-						// that uses it, so identical ones have to be folded.
-						std::set<std::string> seen;
-						IDiaSymbol* symbol = nullptr;
-						ULONG fetched = 0;
-						while (SUCCEEDED(enums->Next(1, &symbol, &fetched)) && fetched == 1) {
-							EnumInfo info = build_enum_info(symbol);
-
-							std::string key = info.namespace_name + "::" + info.name +
-								"|" + std::to_string(info.size);
-							for (const EnumMemberInfo& member : info.members) {
-								key += "|" + member.name + "=" + std::to_string(member.value);
-							}
-
-							if (seen.insert(std::move(key)).second) {
-								result.push_back(std::move(info));
-							}
-
-							symbol->Release();
-							symbol = nullptr;
-						}
-						if (symbol != nullptr) {
-							symbol->Release();
-						}
-						enums->Release();
-					}
-					global_scope->Release();
-				}
-				session->Release();
-			}
-			source->Release();
-		}
-
-	if (uninitialize_com) {
-		CoUninitialize();
-	}
 	return result;
 }
 
-// Base classes are reported as `SymTagBaseClass` children of the UDT symbol;
-// each one carries the actual base UDT in its `type`. Only direct bases, in
-// declaration order - walking the hierarchy means calling this on the results.
-// Non-UDT inputs (pointer/reference/enum/built-in) have no bases -> empty.
-export std::vector<TypeInfo> get_base_type(const TypeInfo& type) {
-	std::vector<TypeInfo> result;
+	std::vector<EnumInfo> parse_enum(std::string_view path) {
+	if (!std::filesystem::exists(path))
+		throw utils::format_runtime_error("File not found: {}", path);
+
+	std::vector<dll_info::EnumInfo> result;
+	const std::wstring wide_path = utf8_to_wide(path);
+	if (wide_path.empty()) {
+		return result;
+	}
+
+	ensure_com_initialized();
+	IDiaDataSource* source = nullptr;
+	if (SUCCEEDED(create_dia_source(&source)) && source != nullptr &&
+		SUCCEEDED(source->loadDataFromPdb(wide_path.c_str()))) {
+		IDiaSession* session = nullptr;
+		if (SUCCEEDED(source->openSession(&session)) && session != nullptr) {
+			IDiaSymbol* global_scope = nullptr;
+			if (SUCCEEDED(session->get_globalScope(&global_scope)) && global_scope != nullptr) {
+				IDiaEnumSymbols* enums = nullptr;
+				if (SUCCEEDED(global_scope->findChildren(
+					SymTagEnum,
+					nullptr,
+					nsNone,
+					&enums)) &&
+					enums != nullptr) {
+					// The same enumeration is reported once per compiland
+					// that uses it, so identical ones have to be folded.
+					std::set<std::string> seen;
+					IDiaSymbol* symbol = nullptr;
+					ULONG fetched = 0;
+					while (SUCCEEDED(enums->Next(1, &symbol, &fetched)) && fetched == 1) {
+						dll_info::EnumInfo info = build_enum_info(symbol);
+
+						std::string key = info.namespace_name + "::" + info.name +
+							"|" + std::to_string(info.size);
+						for (const EnumValue& value : info.values) {
+							key += "|" + value.name + "=" + std::to_string(value.value);
+						}
+
+						if (seen.insert(std::move(key)).second) {
+							result.push_back(std::move(info));
+						}
+
+						symbol->Release();
+						symbol = nullptr;
+					}
+					if (symbol != nullptr) {
+						symbol->Release();
+					}
+					enums->Release();
+				}
+				global_scope->Release();
+			}
+			session->Release();
+		}
+		source->Release();
+	}
+
+	return result;
+}
+
+	std::vector<TypeInfo> parse_class(std::string_view path) {
+	if (!std::filesystem::exists(path))
+		throw utils::format_runtime_error("File not found: {}", path);
+
+	std::vector<dll_info::TypeInfo> result;
+	const std::wstring wide_path = utf8_to_wide(path);
+	if (wide_path.empty()) {
+		return result;
+	}
+
+	ensure_com_initialized();
+	IDiaDataSource* source = nullptr;
+	if (SUCCEEDED(create_dia_source(&source)) && source != nullptr &&
+		SUCCEEDED(source->loadDataFromPdb(wide_path.c_str()))) {
+		IDiaSession* session = nullptr;
+		if (SUCCEEDED(source->openSession(&session)) && session != nullptr) {
+			IDiaSymbol* global_scope = nullptr;
+			if (SUCCEEDED(session->get_globalScope(&global_scope)) && global_scope != nullptr) {
+				IDiaEnumSymbols* classes = nullptr;
+				if (SUCCEEDED(global_scope->findChildren(
+					SymTagUDT,
+					nullptr,
+					nsNone,
+					&classes)) &&
+					classes != nullptr) {
+					std::set<std::string> seen;
+					IDiaSymbol* symbol = nullptr;
+					ULONG fetched = 0;
+					while (SUCCEEDED(classes->Next(1, &symbol, &fetched)) && fetched == 1) {
+						// TypeInfo adopts the reference: on a dedup hit the
+						// moved-out local releases it, on a miss the local
+						// destructs here - exactly one Release either way.
+						dll_info::TypeInfo info(symbol);
+
+						std::string key = info.namespace_name.empty()
+							? info.name
+							: info.namespace_name + "::" + info.name;
+						if (seen.insert(std::move(key)).second) {
+							result.push_back(std::move(info));
+						}
+
+						symbol = nullptr;
+					}
+					classes->Release();
+				}
+				global_scope->Release();
+			}
+			session->Release();
+		}
+		source->Release();
+	}
+
+	return result;
+}
+
+} // namespace dll_info
+
+// ---- Internal helper definitions -------------------------------------------
+// Declared before the namespace (TypeInfo::operator== and parse_enum call
+// them from inline code); defined here because the bodies need the complete
+// types that only exist inside the namespace.
+
+std::vector<dll_info::TypeInfo> get_base_type(const dll_info::TypeInfo& type) {
+	std::vector<dll_info::TypeInfo> result;
 
 	if (type.handle == nullptr) {
 		return result;
@@ -1738,12 +1692,8 @@ export std::vector<TypeInfo> get_base_type(const TypeInfo& type) {
 	return result;
 }
 
-// Depth-first walk of the whole inheritance tree above `type`. `seen` folds
-// diamonds (the same base reached through several paths) and guards against
-// malformed cycles in the type graph. Keys are cv-stripped names so that
-// cv-variants of one base do not slip in twice.
-void collect_base_types(const TypeInfo& type, std::vector<TypeInfo>& chain, std::set<std::string>& seen) {
-	for (const TypeInfo& base : get_base_type(type)) {
+void collect_base_types(const dll_info::TypeInfo& type, std::vector<dll_info::TypeInfo>& chain, std::set<std::string>& seen) {
+	for (const dll_info::TypeInfo& base : get_base_type(type)) {
 		if (seen.insert(base.remove_cv_string()).second) {
 			chain.push_back(base);
 			collect_base_types(base, chain, seen);
@@ -1751,12 +1701,60 @@ void collect_base_types(const TypeInfo& type, std::vector<TypeInfo>& chain, std:
 	}
 }
 
-export std::vector<TypeInfo> get_base_types(const TypeInfo& type) {
-	std::vector<TypeInfo> chain;
+std::vector<dll_info::TypeInfo> get_base_types(const dll_info::TypeInfo& type) {
+	std::vector<dll_info::TypeInfo> chain;
 	std::set<std::string> seen;
 	collect_base_types(type, chain, seen);
 	return chain;
 }
 
+dll_info::EnumInfo build_enum_info(IDiaSymbol* symbol) {
+	dll_info::EnumInfo info;
 
-} // namespace dll_info
+	auto [resolved_name, resolved_namespace] = split_symbol_name(symbol);
+	info.name = std::move(resolved_name);
+	info.namespace_name = std::move(resolved_namespace);
+
+	ULONGLONG length{};
+	if (symbol->get_length(&length) == S_OK) {
+		info.size = length;
+	}
+
+	IDiaEnumSymbols* members = nullptr;
+	if (SUCCEEDED(symbol->findChildren(SymTagData, nullptr, nsNone, &members)) &&
+		members != nullptr) {
+		IDiaSymbol* member = nullptr;
+		ULONG fetched = 0;
+		while (SUCCEEDED(members->Next(1, &member, &fetched)) && fetched == 1) {
+			std::string member_name;
+			std::int64_t member_value = 0;
+
+			BSTR bstr = nullptr;
+			if (member->get_name(&bstr) == S_OK && bstr != nullptr) {
+				member_name = bstr_to_utf8(bstr);
+				SysFreeString(bstr);
+			}
+
+			VARIANT value{};
+			if (member->get_value(&value) == S_OK) {
+				member_value = variant_to_int64(value);
+			}
+
+			// 成员的完整拼写 = 枚举完整限定名 + 成员名，两种比较形态由 EnumValue 内部承载
+			info.values.emplace_back(
+				info.namespace_name.empty()
+					? info.name + "::" + member_name
+					: info.namespace_name + "::" + info.name + "::" + member_name,
+				member_value);
+
+			member->Release();
+			member = nullptr;
+		}
+		if (member != nullptr) {
+			member->Release();
+		}
+		members->Release();
+	}
+
+	return info;
+}
