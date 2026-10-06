@@ -1682,6 +1682,18 @@ export namespace dll_info {
 		return ret;
 	}
 
+	std::vector<InterfaceInfo> parse_interface_filter(std::string_view path, std::string filter = "") {
+		auto interfaces = parse_interface(path);
+		return dll_info::filter(interfaces, filter);
+	}
+	std::vector<TypeInfo> parse_class_filter(std::string_view path, std::string filter = "") {
+		auto types = parse_class(path);
+		return dll_info::filter(types, filter);
+	}
+	std::vector<EnumInfo> parse_enum_filter(std::string_view path, std::string filter = "") {
+		auto enums = parse_enum(path);
+		return dll_info::filter(enums, filter);
+	}
 } // namespace dll_info
 
 // ---- Internal helper definitions -------------------------------------------
